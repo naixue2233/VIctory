@@ -187,17 +187,39 @@ impl Shadow {
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
-    pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+    ///
+    /// `ranges` are `(address, len)` as declared; overlapping ones (the
+    /// world declares many views of one big heap) are merged first, so each
+    /// byte is compared once per submission.
+    pub(crate) fn copy_back(&self, ranges: &[(usize, usize)]) -> usize {
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
-        let (from, to) = self.inside(address, len);
-        let start = self.start as usize;
-        if let Some((taken, before)) = &*snapshot
-            && *taken <= from
-            && to <= taken + before.len()
-            && from < to
+        let spans = merge(ranges.iter().map(|&(a, l)| self.inside(a, l)));
+        if let Some((taken, before)) = &*snapshot {
+            for &(from, to) in &spans {
+                if *taken <= from && to <= taken + before.len() {
+                    written += self.copy_span(from, to, &before[from - taken..to - taken]);
+                }
+            }
+        }
+        // Every submitted step that declared the ranges is done with them
+        // (one submission runs at a time), and the snapshot with the last.
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        pending.retain(|&r| !ranges.iter().any(|&(a, l)| r == (a, a + l)));
+        if pending.is_empty()
+            && let Some((_, bytes)) = snapshot.take()
         {
-            let before = &before[from - taken..to - taken];
+            give_back(bytes);
+        }
+        written
+    }
+
+    /// Copies back `[from, to)` (offsets in the copy), `before` being its
+    /// bytes before the submission. Returns the bytes written.
+    fn copy_span(&self, from: usize, to: usize, before: &[u8]) -> usize {
+        let mut written = 0;
+        let start = self.start as usize;
+        {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
@@ -246,15 +268,6 @@ impl Shadow {
                     copied[page - base] = now;
                 }
             }
-        }
-        // Every submitted step that declared the range is done with it (one
-        // submission runs at a time), and the snapshot with the last range.
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        pending.retain(|&r| r != (address, address + len));
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
-            give_back(bytes);
         }
         written
     }
@@ -377,6 +390,21 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// `[from, to)` spans sorted and merged where they overlap or touch; empty
+/// ones dropped.
+fn merge(spans: impl Iterator<Item = (usize, usize)>) -> Vec<(usize, usize)> {
+    let mut spans: Vec<_> = spans.filter(|(f, t)| f < t).collect();
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (f, t) in spans {
+        match merged.last_mut() {
+            Some(last) if f <= last.1 => last.1 = last.1.max(t),
+            _ => merged.push((f, t)),
+        }
+    }
+    merged
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
@@ -496,4 +524,16 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    /// Overlapping and touching spans become one; empty ones go; apart
+    /// ones stay apart, in order.
+    #[test]
+    fn spans_merge_where_they_overlap_or_touch() {
+        let spans = [(50, 60), (0, 10), (5, 20), (20, 30), (40, 40), (55, 58)];
+        assert_eq!(super::merge(spans.into_iter()), vec![(0, 30), (50, 60)]);
+        assert!(super::merge(std::iter::empty()).is_empty());
+    }
 }

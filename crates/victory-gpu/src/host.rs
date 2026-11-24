@@ -580,21 +580,23 @@ impl Host {
         // passes declare the same big ranges dozens of times).
         let copying = std::time::Instant::now();
         // One list's lock at a time: a submission may name a list twice.
-        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        // By copy: its ranges go back together, overlapping ones merged.
+        type Ranges = Vec<(usize, usize)>;
+        let mut back: Vec<(std::sync::Arc<crate::shadow::Shadow>, Ranges)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
-                    && !back
-                        .iter()
-                        .any(|(s, a, l)| std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len))
-                {
-                    back.push((shadow.clone(), *address, *len));
+                if let Step::GpuWrite(shadow, address, len) = step {
+                    let range = (*address, *len);
+                    match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                        Some((_, ranges)) if !ranges.contains(&range) => ranges.push(range),
+                        Some(_) => {}
+                        None => back.push((shadow.clone(), vec![range])),
+                    }
                 }
             }
         }
-        for (shadow, address, len) in &back {
-            let (address, len) = (*address, *len);
-            let written = shadow.copy_back(address, len);
+        for (shadow, ranges) in &back {
+            let written = shadow.copy_back(ranges);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
