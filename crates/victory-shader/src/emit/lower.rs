@@ -174,6 +174,11 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Single-wave LDS lockstep synchronised by barriers instead of `WaveSize(64)`:
+    /// instructions `(block, index)` that need a group-shared barrier before them,
+    /// and uniform blocks that need one before branching into a divergent region.
+    lds_barrier_before: HashSet<(usize, usize)>,
+    lds_barrier_end: HashSet<usize>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword, and the row packed after it.
     half_outputs: HashMap<u8, (bool, Option<u8>)>,
@@ -237,6 +242,309 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+
+/// Whether `i` is an LDS memory instruction (not a cross-lane swizzle or permute).
+fn is_lds_mem(i: &Inst) -> bool {
+    let n = i.name();
+    matches!(i.fields, Fields::Ds { .. }) && !n.starts_with("ds_swizzle") && !n.contains("permute")
+}
+
+/// Whether `i` writes (or atomically modifies) LDS memory.
+fn is_lds_write(i: &Inst) -> bool {
+    is_lds_mem(i) && !i.name().starts_with("ds_read")
+}
+
+/// Whether `i` reads (or atomically reads-modifies) LDS memory.
+fn is_lds_read(i: &Inst) -> bool {
+    is_lds_mem(i) && !i.name().starts_with("ds_write")
+}
+
+/// Planned threadgroup-uniform LDS barriers for a single-wave Wave64 shader.
+struct LdsBarriers {
+    before: HashSet<(usize, usize)>,
+    at_end: HashSet<usize>,
+}
+
+/// Plans thread-group LDS barriers for a single-wave Wave64 compute shader
+/// (`threads <= 64`) so it does not rely on 64-lane lockstep (`WaveSize(64)`).
+///
+/// Returns `Some(barriers)` when every cross-lane LDS read/write hazard
+/// passes through a threadgroup-uniform block where `dx.op.barrier` is safe;
+/// returns `None` when a divergent region itself has both an LDS write and an
+/// LDS read without reconverging.
+fn plan_lds_barriers(p: &Program, st: &Structured) -> Option<LdsBarriers> {
+    let n = p.blocks.len();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut reachable = vec![false; n];
+    for &b in &order {
+        reachable[b] = true;
+    }
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
+    for &b in &order {
+        match st.exits[b] {
+            LaneExit::Jump(t) if reachable[t] => succs[b].push(t),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                if reachable[taken] {
+                    succs[b].push(taken);
+                }
+                if not_taken != taken && reachable[not_taken] {
+                    succs[b].push(not_taken);
+                }
+            }
+            LaneExit::End | LaneExit::Indirect => succs[b].push(n),
+            _ => {}
+        }
+    }
+    // Post-dominators with virtual exit node `n`.
+    let words = (n + 1).div_ceil(64);
+    let mut pdom = vec![vec![u64::MAX; words]; n + 1];
+    pdom[n] = vec![0; words];
+    pdom[n][n / 64] = 1u64 << (n % 64);
+    loop {
+        let mut changed = false;
+        for &b in order.iter().rev() {
+            if succs[b].is_empty() {
+                continue;
+            }
+            let mut next = pdom[succs[b][0]].clone();
+            for &s in &succs[b][1..] {
+                for w in 0..words {
+                    next[w] &= pdom[s][w];
+                }
+            }
+            next[b / 64] |= 1u64 << (b % 64);
+            if next != pdom[b] {
+                pdom[b] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let postdom = |a: usize, b: usize| -> bool { (pdom[b][a / 64] >> (a % 64)) & 1 != 0 };
+
+    // Values that can differ between the two 32-lane halves of a Wave64 wave:
+    // vector inputs, vector loads/atomics/cross-lane ops, guarded vector writes,
+    // and any value (including a scalar from `v_readfirstlane_b32`) derived from them.
+    let mut varying: HashSet<Value> = p
+        .inputs
+        .iter()
+        .filter(|&&(r, _)| matches!(r, Reg::V(_)))
+        .map(|&(_, v)| v)
+        .collect();
+    for &b in &order {
+        for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+            let produces_varying = match &inst.fields {
+                Fields::Buffer { .. }
+                | Fields::Image { .. }
+                | Fields::Ds { .. }
+                | Fields::Flat { .. } => true,
+                Fields::Valu(v) => {
+                    st.guards[b][i].is_some()
+                        || v.dpp.is_some()
+                        || inst.name().starts_with("v_mbcnt")
+                        || matches!(inst.name(), "v_readlane_b32" | "v_writelane_b32")
+                }
+                _ => false,
+            };
+            if produces_varying {
+                for &(_, w) in &inst.writes {
+                    varying.insert(w);
+                }
+            }
+        }
+    }
+    let inst_reads_varying = |inst: &Inst, varying: &HashSet<Value>| -> bool {
+        if let Fields::Valu(v) = &inst.fields {
+            // Check explicit source operands so an unguarded `v_mov_b32 v, s`
+            // does not inherit `varying` from its implicit EXEC / old-dst reads.
+            v.src.iter().any(|op| match *op {
+                Operand::Vector { reg, .. } => inst
+                    .read(Reg::V(reg))
+                    .is_some_and(|val| varying.contains(&val)),
+                Operand::Scalar { code, .. } if code != NULL => inst
+                    .read(Reg::S(code))
+                    .is_some_and(|val| varying.contains(&val)),
+                _ => false,
+            })
+        } else {
+            inst.reads.iter().any(|&(_, val)| varying.contains(&val))
+        }
+    };
+    let mut non_uniform = vec![false; n];
+    loop {
+        let mut changed = false;
+        // Propagate `varying` across phis and instructions.
+        loop {
+            let before_len = varying.len();
+            for &b in &order {
+                for phi in &p.blocks[b].phis {
+                    let from_div = p.blocks[b]
+                        .preds
+                        .iter()
+                        .any(|&pred| reachable[pred] && non_uniform[pred]);
+                    if matches!(phi.reg, Reg::V(_))
+                        || from_div
+                        || phi.args.iter().any(|a| varying.contains(a))
+                    {
+                        varying.insert(phi.value);
+                    }
+                }
+                for inst in &p.blocks[b].insts {
+                    if inst_reads_varying(inst, &varying) {
+                        for &(_, w) in &inst.writes {
+                            varying.insert(w);
+                        }
+                    }
+                }
+            }
+            if varying.len() == before_len {
+                break;
+            }
+            changed = true;
+        }
+        // Because `threads <= 64` fits in one console wave, every branch whose
+        // condition depends only on threadgroup-uniform `Atom::Uniform`s takes
+        // the same edge in every thread of the group. Any block reachable from a
+        // divergent branch before strictly post-dominating it is non-uniform.
+        for &d in &order {
+            let LaneExit::Branch { when, .. } = st.exits[d] else {
+                continue;
+            };
+            let uniform = !non_uniform[d]
+                && st
+                    .bools
+                    .support(when)
+                    .iter()
+                    .all(|a| matches!(a, Atom::Uniform(v) if !varying.contains(v)));
+            if uniform {
+                continue;
+            }
+            let mut stack = succs[d].clone();
+            let mut vis = vec![false; n + 1];
+            while let Some(cur) = stack.pop() {
+                if cur == n || vis[cur] || (cur != d && postdom(cur, d)) {
+                    continue;
+                }
+                vis[cur] = true;
+                if !non_uniform[cur] {
+                    non_uniform[cur] = true;
+                    changed = true;
+                }
+                stack.extend_from_slice(&succs[cur]);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Refuse if any non-uniform region has a RAW or WAR hazard without passing
+    // through a uniform block.
+    for &b in &order {
+        if !non_uniform[b] {
+            continue;
+        }
+        let (mut saw_w, mut saw_r) = (false, false);
+        for inst in &p.blocks[b].insts {
+            let (w, r) = (is_lds_write(inst), is_lds_read(inst));
+            if (saw_w && r) || (saw_r && w) {
+                return None;
+            }
+            saw_w |= w;
+            saw_r |= r;
+        }
+        if saw_w || saw_r {
+            let mut stack: Vec<usize> = succs[b]
+                .iter()
+                .copied()
+                .filter(|&s| s < n && non_uniform[s])
+                .collect();
+            let mut vis = vec![false; n];
+            while let Some(cur) = stack.pop() {
+                if vis[cur] {
+                    continue;
+                }
+                vis[cur] = true;
+                let cw = p.blocks[cur].insts.iter().any(is_lds_write);
+                let cr = p.blocks[cur].insts.iter().any(is_lds_read);
+                if (saw_w && cr) || (saw_r && cw) {
+                    return None;
+                }
+                for &s in &succs[cur] {
+                    if s < n && non_uniform[s] {
+                        stack.push(s);
+                    }
+                }
+            }
+        }
+    }
+
+    // Forward dataflow: bit 0 = unsynchronised LDS write, bit 1 = unsynchronised LDS read.
+    const W: u8 = 1;
+    const R: u8 = 2;
+    let mut in_state = vec![0u8; n];
+    let mut out_state = vec![0u8; n];
+    let mut before = HashSet::new();
+    let mut at_end = HashSet::new();
+    loop {
+        let mut changed = false;
+        before.clear();
+        at_end.clear();
+        for &b in &order {
+            let mut state = 0u8;
+            for &pred in &p.blocks[b].preds {
+                if reachable[pred] {
+                    state |= out_state[pred];
+                }
+            }
+            in_state[b] = state;
+            if non_uniform[b] {
+                for inst in &p.blocks[b].insts {
+                    if is_lds_write(inst) {
+                        state |= W;
+                    }
+                    if is_lds_read(inst) {
+                        state |= R;
+                    }
+                }
+            } else {
+                for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+                    if inst.name() == "s_barrier" {
+                        state = 0;
+                        continue;
+                    }
+                    let (w, r) = (is_lds_write(inst), is_lds_read(inst));
+                    if (w && state & R != 0) || (r && state & W != 0) {
+                        before.insert((b, i));
+                        state = 0;
+                    }
+                    if w {
+                        state |= W;
+                    }
+                    if r {
+                        state |= R;
+                    }
+                }
+                if state != 0 && succs[b].iter().any(|&s| s < n && non_uniform[s]) {
+                    at_end.insert(b);
+                    state = 0;
+                }
+            }
+            if state != out_state[b] {
+                out_state[b] = state;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Some(LdsBarriers { before, at_end })
+}
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -341,19 +649,19 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        let mut lds_barrier_before = HashSet::new();
+        let mut lds_barrier_end = HashSet::new();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
-            // Code reading other lanes needs the console's wave size and
-            // lane order; so do lane masks read as numbers, and LDS shared
-            // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            // Operations that can cross the 32-lane boundary require the
+            // console's full wave size; `ds_swizzle` and `DPP` stay inside each
+            // 32-lane half-wave and match bit for bit at `WaveSize(32)`.
+            let cross_32_lanes = insts().any(|i| {
                 let n = i.name();
-                n.starts_with("ds_swizzle")
-                    || n.contains("permute")
+                n.contains("permute")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
                 // Masks held as numbers or constant lane sets: the lane
@@ -379,10 +687,53 @@ impl<'a> Lower<'a> {
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
             };
+            let local_32_lanes = insts().any(|i| {
+                i.name().starts_with("ds_swizzle")
+                    || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
+            });
+            console_lanes = cross_32_lanes || local_32_lanes;
+            // `v_readfirstlane_b32` and whole-wave `Active`/`Prefix`
+            // reductions read across the host wave. They are fine on any host
+            // wave size by themselves, but once a Wave64 program already needs
+            // wave-sized execution (`local_32_lanes` or single-wave LDS), they
+            // must see all 64 lanes: `WaveSize(32)` would hand lanes 32..63 a
+            // different first lane, and barriers in place of `WaveSize(64)`
+            // would split the reduction into two half-waves.
+            let has_readfirstlane = insts().any(|i| i.name() == "v_readfirstlane_b32");
+            let has_wave_reduction = (0..p.blocks.len()).any(|b| {
+                super::wave::sections(p, b).values().any(|sec| {
+                    sec.shapes.values().any(|sh| {
+                        matches!(
+                            sh,
+                            super::wave::Shape::Active(..) | super::wave::Shape::Prefix(..)
+                        )
+                    })
+                })
+            });
+            let full_wave_only =
+                cross_32_lanes || (x.native.wave64 && (has_readfirstlane || has_wave_reduction));
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let total_threads = cs.threads.iter().product::<u32>();
+            let one_wave = total_threads <= wave;
+            let uses_lds = s.lds_dwords > 0 && insts().any(is_lds_mem);
+            let mut needs_lds_wave = one_wave && uses_lds;
+            // On a Wave64 single-wave shader with LDS (threads 33..=64), replace
+            // implicit 64-lane lockstep with explicit group-shared barriers in
+            // uniform control flow so Wave32-only GPUs do not reject it.
+            if needs_lds_wave
+                && x.native.wave64
+                && total_threads > 32
+                && !full_wave_only
+                && let Some(barriers) = plan_lds_barriers(p, x.st)
+            {
+                lds_barrier_before = barriers.before;
+                lds_barrier_end = barriers.at_end;
+                needs_lds_wave = false;
+            }
+            if cross_32_lanes || needs_lds_wave || (local_32_lanes && full_wave_only) {
                 s.wave_size = Some(wave);
+            } else if local_32_lanes {
+                s.wave_size = Some(32);
             }
         }
         let mut no_barrier = HashSet::new();
@@ -469,6 +820,8 @@ impl<'a> Lower<'a> {
             console_lanes,
             flat: None,
             no_barrier,
+            lds_barrier_before,
+            lds_barrier_end,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -863,6 +1216,9 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                if self.lds_barrier_before.contains(&(b, i)) {
+                    self.emit_lds_barrier();
+                }
                 self.inst(b, i)?;
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -872,6 +1228,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if self.lds_barrier_end.contains(&b) {
+                self.emit_lds_barrier();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -1814,16 +2173,20 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Component `c` of the thread id in the group. With console lanes, the
-    /// thread is relabelled so that its host lane is its console lane: the
-    /// flat id is the wave's first lane's, rounded down to the wave size,
-    /// plus the lane index. (A bijection while each host wave holds a
-    /// wave-aligned run of flat ids, as the console's waves do.)
-    fn thread_id(&mut self, c: u8) -> Val {
-        if !self.console_lanes {
-            return self.compute_id("threadIdInGroup.i32", 95, c);
+    /// Group-shared memory barrier + thread-group sync (`GroupMemoryBarrierWithGroupSync`).
+    fn emit_lds_barrier(&mut self) {
+        let mode = self.s.m.i32(1 | 8);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The thread's relabelled flat index in the group when `console_lanes` is active
+    /// (created once in the entry block so it dominates every use).
+    fn console_flat(&mut self) -> V {
+        if let Some(f) = self.flat {
+            return f;
         }
-        let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
         let flat = self.s.op(
@@ -1845,9 +2208,27 @@ impl<'a> Lower<'a> {
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
+        let lane = self
+            .s
+            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
+        self.flat = Some(f);
+        f
+    }
+
+    /// Component `c` of the thread id in the group. With console lanes, the
+    /// thread is relabelled so that its host lane is its console lane: the
+    /// flat id is the wave's first lane's, rounded down to the wave size,
+    /// plus the lane index. (A bijection while each host wave holds a
+    /// wave-aligned run of flat ids, as the console's waves do.)
+    fn thread_id(&mut self, c: u8) -> Val {
+        if !self.console_lanes {
+            return self.compute_id("threadIdInGroup.i32", 95, c);
+        }
+        let [x, y, _] = self.s.threads.expect("compute");
+        let e = self.s.entry;
+        let f = self.console_flat();
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
             0 => self.s.m.bin(e, Bin::URem, f, xk),
@@ -3468,9 +3849,17 @@ impl<'a> Lower<'a> {
             }
         }
         if let Some((rows, banks)) = masks {
-            // Row (16 lanes) and bank (4 lanes of a row) write masks.
+            // Row (16 lanes) and bank (4 lanes of a row) write masks. When a
+            // Wave64 shader runs at WaveSize(32), the row index (0..3) comes
+            // from the console lane (`console_flat & 63`) so rows 2 and 3 still
+            // select the upper half-wave.
             let (four, two, three) = (k(self, 4), k(self, 2), k(self, 3));
-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
+            let row_lane = if self.x.native.wave64 && self.s.wave_size == Some(32) {
+                self.console_flat()
+            } else {
+                lane
+            };
+            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
             let ri = self.s.m.bin(c, Bin::And, ri, three);
             let bi = self.s.m.bin(c, Bin::LShr, lane, two);
             let bi = self.s.m.bin(c, Bin::And, bi, three);
@@ -6559,8 +6948,10 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
-    use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
+    use super::{Numeric, Parts, buffer_format, lower, plan_lds_barriers};
+    use crate::dxbc::{Container, FourCC};
+    use crate::emit::{self, HostShader};
+    use crate::native::{ComputeIo, HwStage, NativeProgram, RootParam, RootType, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -6649,5 +7040,466 @@ mod tests {
         assert_eq!(buffer_format(0), None);
         assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    fn words_to_bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    fn sop1_mov_imm(sdst: u8, imm: u8) -> u32 {
+        (0x17D << 23) | (u32::from(sdst) << 16) | (0x03 << 8) | u32::from(imm)
+    }
+
+    fn sop2(op: u32, sdst: u8, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0b10 << 30)
+            | (op << 23)
+            | (u32::from(sdst) << 16)
+            | (u32::from(ssrc1) << 8)
+            | u32::from(ssrc0)
+    }
+
+    fn sopc(op: u32, ssrc0: u8, ssrc1: u8) -> u32 {
+        (0x17E << 23) | (op << 16) | (u32::from(ssrc1) << 8) | u32::from(ssrc0)
+    }
+
+    fn sopp(op: u32, simm16: i16) -> u32 {
+        (0x17F << 23) | (op << 16) | u32::from(simm16 as u16)
+    }
+
+    fn s_load_dwordx4(sdst: u8, sbase: u8) -> [u32; 2] {
+        [
+            (0x3D << 26) | (0x02 << 18) | (u32::from(sdst) << 6) | u32::from(sbase >> 1),
+            125u32 << 25,
+        ]
+    }
+
+    fn vop1(op: u32, vdst: u8, src0: u32) -> u32 {
+        (0x3F << 25) | (u32::from(vdst) << 17) | (op << 9) | src0
+    }
+
+    fn vop2(op: u32, vdst: u8, src0: u32, vsrc1: u8) -> u32 {
+        (op << 25) | (u32::from(vdst) << 17) | (u32::from(vsrc1) << 9) | src0
+    }
+
+    fn v_mov_dpp(
+        vdst: u8,
+        vsrc: u8,
+        ctrl: u16,
+        row_mask: u8,
+        bank_mask: u8,
+        bound_ctrl: bool,
+    ) -> [u32; 2] {
+        let w0 = vop1(0x01, vdst, 0xFA);
+        let w1 = (u32::from(row_mask) << 28)
+            | (u32::from(bank_mask) << 24)
+            | (u32::from(bound_ctrl) << 19)
+            | (u32::from(ctrl) << 8)
+            | u32::from(vsrc);
+        [w0, w1]
+    }
+
+    fn ds_write_b32(vaddr: u8, vdata: u8) -> [u32; 2] {
+        [
+            (0x36 << 26) | (0x0D << 18),
+            (u32::from(vdata) << 8) | u32::from(vaddr),
+        ]
+    }
+
+    fn ds_read_b32(vdst: u8, vaddr: u8) -> [u32; 2] {
+        [
+            (0x36 << 26) | (0x36 << 18),
+            (u32::from(vdst) << 24) | u32::from(vaddr),
+        ]
+    }
+
+    fn ds_swizzle_b32(vdst: u8, vsrc: u8, offset: u16) -> [u32; 2] {
+        [
+            (0x36 << 26) | (0x35 << 18) | u32::from(offset),
+            (u32::from(vdst) << 24) | u32::from(vsrc),
+        ]
+    }
+
+    fn buffer_store_dword(vdata: u8, vaddr: u8, srsrc: u8) -> [u32; 2] {
+        [
+            (0x38 << 26) | (0x1C << 18) | (1 << 12),
+            (0x80 << 24)
+                | (u32::from(srsrc >> 2) << 16)
+                | (u32::from(vdata) << 8)
+                | u32::from(vaddr),
+        ]
+    }
+
+    fn emit_synthetic_cs(
+        words: &[u32],
+        threads: [u32; 3],
+        lds_granules: u32,
+    ) -> (HostShader, ir::Program, structure::Structured) {
+        // user_sgprs = 1 (s0: UAV descriptor table), thread_id_vgprs = 1 (v0), lds = lds_granules * 512B
+        let rsrc2 = (1 << 1) | (lds_granules << 15);
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 16,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo { rsrc2, threads }),
+            code: words_to_bytes(words),
+        };
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let empty = super::super::container::build(&[]);
+        let c = Container::parse(&empty).unwrap();
+        let hs = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        (hs, p, st)
+    }
+
+    fn psv_wave_size(dxil: &[u8]) -> Option<u32> {
+        let c = Container::parse(dxil).unwrap();
+        let psv = c.part(FourCC::PSV0).unwrap().data;
+        let min = u32::from_le_bytes(psv[20..24].try_into().unwrap());
+        let max = u32::from_le_bytes(psv[24..28].try_into().unwrap());
+        (min != 0 && min == max).then_some(min)
+    }
+
+    #[cfg(windows)]
+    fn validate_and_run_cs(hs: &HostShader, uav_dwords: u32) -> Option<Vec<u32>> {
+        use super::super::host::{Dispatch, Host, Root, View};
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut hs.dxil.clone()).unwrap();
+        }
+        let Ok(host) = Host::new(false) else {
+            return None;
+        };
+        let (root, pso) = match host.compute_pipeline(hs) {
+            Ok(p) => p,
+            // WARP supports no fixed WaveSize (32 or 64), and Wave32-only
+            // adapters reject `WaveSize(64)`.
+            Err(_)
+                if psv_wave_size(&hs.dxil) == Some(64)
+                    || (psv_wave_size(&hs.dxil).is_some()
+                        && std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1")) =>
+            {
+                return None;
+            }
+            Err(e) => panic!("compute_pipeline failed: {e}"),
+        };
+        let views = [View::RawUav(uav_dwords)];
+        let mut ud = vec![0u32; hs.user_data_dwords() as usize];
+        for u in &hs.user_data {
+            ud[u.index as usize] = 0;
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        Some(out[0].clone())
+    }
+
+    #[test]
+    fn wave64_single_wave_lds_adds_barriers_and_drops_wave_size() {
+        // Each lane writes `tid + 100` to `lds[tid * 4]`, then without any
+        // `s_barrier` reads `lds[(tid ^ 32) * 4]` (crossing the 32-lane half
+        // boundary) and stores it to `uav[tid * 4]`.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = v0 << 2 (tid * 4)
+        w.push(vop2(0x25, 2, 0xFF, 0)); // v2 = v0 + 100
+        w.push(100);
+        w.extend(ds_write_b32(1, 2)); // lds[tid * 4] = tid + 100
+        w.push(vop2(0x1D, 3, 0xA0, 0)); // v3 = v0 ^ 32 (const 32 = 0x80 + 32 = 0xA0)
+        w.push(vop2(0x1A, 3, 0x82, 3)); // v3 = (tid ^ 32) * 4
+        w.extend(ds_read_b32(4, 3)); // v4 = lds[(tid ^ 32) * 4]
+        w.extend(buffer_store_dword(4, 1, 4)); // uav[tid * 4] = v4
+        w.push(S_ENDPGM);
+
+        let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        let barriers = plan_lds_barriers(&p, &st).expect("uniform LDS barriers");
+        assert!(
+            !barriers.before.is_empty(),
+            "expected RAW barrier before ds_read_b32"
+        );
+        assert!(barriers.at_end.is_empty());
+        assert_eq!(psv_wave_size(&hs.dxil), None);
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            let expected: Vec<u32> = (0..64u32).map(|tid| (tid ^ 32) + 100).collect();
+            assert_eq!(out[..64], expected[..]);
+        }
+    }
+
+    #[test]
+    fn wave64_single_wave_lds_uniform_loop_syncs_raw_and_war() {
+        // Uniform 4-iteration loop with no `s_barrier`: each iteration writes
+        // `acc` to `lds[tid * 4]`, reads `lds[(tid ^ 32) * 4]`, and adds 1.
+        // Needs both a RAW barrier before the read and a WAR barrier before
+        // the next iteration's write.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(sop1_mov_imm(2, 0x84)); // s2 = 4 (loop counter)
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop2(0x1D, 3, 0xA0, 0)); // v3 = tid ^ 32
+        w.push(vop2(0x1A, 3, 0x82, 3)); // v3 = (tid ^ 32) * 4
+        w.push(vop2(0x25, 2, 0x80, 0)); // v2 = tid (initial acc)
+        let loop_start = w.len();
+        w.extend(ds_write_b32(1, 2)); // lds[tid * 4] = acc
+        w.extend(ds_read_b32(2, 3)); // acc = lds[(tid ^ 32) * 4]
+        w.push(vop2(0x25, 2, 0x81, 2)); // acc += 1
+        w.push(sop2(0x01, 2, 2, 0x81)); // s_sub_u32 s2, s2, 1
+        w.push(sopc(0x06, 2, 0x80)); // s_cmp_eq_u32 s2, 0
+        let branch_idx = w.len();
+        let rel = (loop_start as isize - (branch_idx as isize + 1)) as i16;
+        w.push(sopp(0x04, rel)); // s_cbranch_scc0 loop_start
+        w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = acc
+        w.push(S_ENDPGM);
+
+        let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        let barriers = plan_lds_barriers(&p, &st).expect("uniform loop LDS barriers");
+        assert_eq!(
+            barriers.before.len(),
+            2,
+            "expected both RAW and WAR barriers: {:?}",
+            barriers.before
+        );
+        assert_eq!(psv_wave_size(&hs.dxil), None);
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            // 4 swaps of (tid <-> tid ^ 32) returns to tid, +4 total.
+            let expected: Vec<u32> = (0..64u32).map(|tid| tid + 4).collect();
+            assert_eq!(out[..64], expected[..]);
+        }
+    }
+
+    #[test]
+    fn wave64_divergent_lds_hazard_keeps_wave_size_64() {
+        // Divergent branch containing both an LDS write and an LDS read
+        // without reconverging must refuse barrier planning and keep WaveSize(64).
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80));
+        w.extend(s_load_dwordx4(4, 0));
+        w.push(vop2(0x1A, 1, 0x82, 0));
+        // v_cmp_gt_u32 vcc, 32, v0  (32 > v0, i.e., tid < 32)
+        w.push((0x3E << 25) | (0xC4 << 17) | 0xA0);
+        // s_and_saveexec_b64 s[2:3], vcc (SOP1 op 0x24)
+        w.push((0x17D << 23) | (2 << 16) | (0x24 << 8) | 0x6A);
+        // s_cbranch_execz +4 dwords (skip ds_write + ds_read)
+        w.push(sopp(0x08, 4));
+        w.extend(ds_write_b32(1, 0));
+        w.extend(ds_read_b32(2, 1));
+        // s_or_b64 exec, exec, s[2:3] (SOP2 op 0x11)
+        w.push(sop2(0x11, 126, 126, 2));
+        w.extend(buffer_store_dword(2, 1, 4));
+        w.push(S_ENDPGM);
+
+        let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        assert!(plan_lds_barriers(&p, &st).is_none());
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+    }
+
+    #[test]
+    fn wave64_divergent_write_reconverging_before_read_adds_barrier() {
+        // Divergent write (`if (tid < 32) lds[tid * 4] = tid + 50`) reconverges
+        // before all 64 lanes read `lds[(tid & 31) * 4]`: safe to synchronise
+        // at the uniform reconvergence block and drop WaveSize(64).
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80));
+        w.extend(s_load_dwordx4(4, 0));
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop2(0x25, 2, 0xFF, 0)); // v2 = tid + 50
+        w.push(50);
+        // v_cmp_gt_u32 vcc, 32, v0 (tid < 32)
+        w.push((0x3E << 25) | (0xC4 << 17) | 0xA0);
+        // s_and_saveexec_b64 s[2:3], vcc
+        w.push((0x17D << 23) | (2 << 16) | (0x24 << 8) | 0x6A);
+        // s_cbranch_execz +2 dwords (skip ds_write)
+        w.push(sopp(0x08, 2));
+        w.extend(ds_write_b32(1, 2));
+        // s_or_b64 exec, exec, s[2:3] (reconverge)
+        w.push(sop2(0x11, 126, 126, 2));
+        // v3 = (tid & 31) * 4  (v_and_b32 = VOP2 op 0x1B, const 31 = 0x9F)
+        w.push(vop2(0x1B, 3, 0x9F, 0));
+        w.push(vop2(0x1A, 3, 0x82, 3));
+        w.extend(ds_read_b32(4, 3));
+        w.extend(buffer_store_dword(4, 1, 4));
+        w.push(S_ENDPGM);
+
+        let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        let barriers = plan_lds_barriers(&p, &st).expect("reconverged LDS barrier");
+        assert!(!barriers.before.is_empty());
+        assert_eq!(psv_wave_size(&hs.dxil), None);
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            let expected: Vec<u32> = (0..64u32).map(|tid| (tid & 31) + 50).collect();
+            assert_eq!(out[..64], expected[..]);
+        }
+    }
+
+    #[test]
+    fn wave64_readfirstlane_of_tid_branch_keeps_wave_size_64() {
+        // A scalar branch driven by `v_readfirstlane_b32(v0)` differs between
+        // lanes 0..31 and 32..63 at Wave32, so it must be treated as divergent.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80));
+        w.extend(s_load_dwordx4(4, 0));
+        w.push(vop2(0x1A, 1, 0x82, 0));
+        // v_readfirstlane_b32 s2, v0 (VOP1 op 0x02, vdst=sdst=2, src0=256+0)
+        w.push(vop1(0x02, 2, 256));
+        w.push(sopc(0x06, 2, 0x80)); // s_cmp_eq_u32 s2, 0
+        w.push(sopp(0x04, 4)); // s_cbranch_scc0 +4 dwords (skip ds_write + ds_read)
+        w.extend(ds_write_b32(1, 0));
+        w.extend(ds_read_b32(2, 1));
+        w.extend(buffer_store_dword(2, 1, 4));
+        w.push(S_ENDPGM);
+
+        let (hs, p, st) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        assert!(plan_lds_barriers(&p, &st).is_none());
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+    }
+
+    #[test]
+    fn wave64_dpp_with_readfirstlane_keeps_wave_size_64() {
+        // An identity `quad_perm` DPP next to `v_readfirstlane_b32 s9, v0`:
+        // every lane stores lane 0's id. At `WaveSize(32)` lanes 32..63 would
+        // read their own first lane (32) instead.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        // v_mov_b32_dpp v3, v0 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf
+        w.extend(v_mov_dpp(3, 0, 0xE4, 0xF, 0xF, false));
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop1(0x01, 2, 9)); // v_mov_b32 v2, s9
+        w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = v2
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 0);
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            for (tid, &v) in out[..64].iter().enumerate() {
+                assert_eq!(v, 0, "readfirstlane mismatch at lane {tid}");
+            }
+        }
+    }
+
+    #[test]
+    fn wave64_single_wave_lds_with_readfirstlane_keeps_wave_size_64() {
+        // Single-wave LDS exchange across the 32-lane halves plus a
+        // `v_readfirstlane_b32` that is only used as data, not for branching.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop2(0x25, 2, 0xFF, 0)); // v2 = tid + 100
+        w.push(100);
+        w.extend(ds_write_b32(1, 2)); // lds[tid * 4] = tid + 100
+        w.push(vop2(0x1D, 3, 0xA0, 0)); // v3 = tid ^ 32
+        w.push(vop2(0x1A, 3, 0x82, 3)); // v3 = (tid ^ 32) * 4
+        w.extend(ds_read_b32(4, 3)); // v4 = lds[(tid ^ 32) * 4]
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop2(0x25, 4, 9, 4)); // v4 = s9 + v4
+        w.extend(buffer_store_dword(4, 1, 4)); // uav[tid * 4] = v4
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 1);
+        assert_eq!(psv_wave_size(&hs.dxil), Some(64));
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 64) {
+            let expected: Vec<u32> = (0..64u32).map(|tid| (tid ^ 32) + 100).collect();
+            assert_eq!(out[..64], expected[..]);
+        }
+    }
+
+    #[test]
+    fn wave64_readfirstlane_only_keeps_no_wave_size() {
+        // `v_readfirstlane_b32` alone (no DPP, `ds_swizzle` or single-wave
+        // LDS) needs no fixed wave size.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        w.push(vop1(0x02, 9, 256)); // v_readfirstlane_b32 s9, v0
+        w.push(vop1(0x01, 2, 9)); // v_mov_b32 v2, s9
+        w.extend(buffer_store_dword(2, 1, 4)); // uav[tid * 4] = v2
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 0);
+        assert_eq!(psv_wave_size(&hs.dxil), None);
+    }
+
+    #[test]
+    fn wave64_local_swizzle_and_dpp_row_mask_uses_wave_size_32() {
+        // Uses `ds_swizzle_b32` (XOR 16, within each 32-lane half-wave) and
+        // `v_mov_b32_dpp` with `row_shr:1`, `row_mask:0xC` (only console rows
+        // 2 and 3, i.e., lanes 32..63) and `bound_ctrl:1`.
+        let mut w = Vec::new();
+        w.push(sop1_mov_imm(1, 0x80)); // s1 = 0
+        w.extend(s_load_dwordx4(4, 0)); // s[4:7] = uav0 descriptor
+        w.push(vop2(0x1A, 1, 0x82, 0)); // v1 = tid * 4
+        // ds_swizzle_b32 v2, v0 offset:swizzle(BITMASK_PERM, "01111" and=0x1f or=0 xor=16)
+        // offset = (xor << 10) | (or << 5) | and = (16 << 10) | 0x1F = 0x401F
+        w.extend(ds_swizzle_b32(2, 0, 0x401F));
+        // v3 = 0x9999 (sentinel preserved on masked-off rows 0 and 1)
+        w.push(vop1(0x01, 3, 0xFF));
+        w.push(0x9999);
+        // v_mov_b32_dpp v3, v0 row_shr:1 row_mask:0xC bank_mask:0xF bound_ctrl:1
+        w.extend(v_mov_dpp(3, 0, 0x111, 0xC, 0xF, true));
+        // Store swizzle to uav[tid * 4] and DPP to uav[(64 + tid) * 4]
+        w.extend(buffer_store_dword(2, 1, 4));
+        w.push(vop2(0x25, 4, 0xFF, 1)); // v4 = tid * 4 + 256
+        w.push(256);
+        w.extend(buffer_store_dword(3, 4, 4));
+        w.push(S_ENDPGM);
+
+        let (hs, _, _) = emit_synthetic_cs(&w, [64, 1, 1], 0);
+        assert_eq!(psv_wave_size(&hs.dxil), Some(32));
+
+        #[cfg(windows)]
+        if let Some(out) = validate_and_run_cs(&hs, 128) {
+            for tid in 0..64u32 {
+                assert_eq!(
+                    out[tid as usize],
+                    tid ^ 16,
+                    "swizzle mismatch at lane {tid}"
+                );
+                let expected_dpp = if tid < 32 {
+                    0x9999
+                } else if tid % 16 == 0 {
+                    0
+                } else {
+                    tid - 1
+                };
+                assert_eq!(
+                    out[(64 + tid) as usize],
+                    expected_dpp,
+                    "DPP row_mask mismatch at lane {tid}"
+                );
+            }
+        }
     }
 }
