@@ -53,6 +53,7 @@ pub(crate) struct Host {
     messages: Option<ID3D12InfoQueue>,
     next_rtv: AtomicU32,
     presenter: Mutex<Option<Presenter>>,
+    null_root: OnceLock<Option<(ID3D12Resource, u64)>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -222,6 +223,7 @@ fn create() -> windows::core::Result<Host> {
             messages,
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
+            null_root: OnceLock::new(),
         })
     }
 }
@@ -273,6 +275,16 @@ mod tests {
             warp_adapter().is_ok(),
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
+    }
+
+    #[test]
+    fn null_root_view_is_aligned() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let gpu = host.null_root_view().unwrap();
+        assert_ne!(gpu, 0);
+        assert!(gpu.is_multiple_of(256));
     }
 }
 
@@ -800,6 +812,23 @@ impl Host {
                 .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
             handle
         }
+    }
+
+    /// A 64 KiB zeroed buffer for unset or null root CBVs and SRVs, so a
+    /// freshly bound root signature never leaves a root descriptor undefined.
+    pub(crate) fn null_root_view(&self) -> Option<u64> {
+        self.null_root
+            .get_or_init(|| {
+                let (buffer, data) = self.shared_buffer(1 << 16)?;
+                name(&buffer, || "null root view".into());
+                // safety: `shared_buffer(1 << 16)` returns a mapped 64 KiB buffer.
+                unsafe {
+                    data.write_bytes(0, 1 << 16);
+                    Some((buffer.clone(), buffer.GetGPUVirtualAddress()))
+                }
+            })
+            .as_ref()
+            .map(|(_, gpu)| *gpu)
     }
 }
 

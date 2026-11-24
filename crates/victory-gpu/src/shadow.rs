@@ -396,6 +396,9 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address == 0 {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     let mut map = buffers();
     let key = map

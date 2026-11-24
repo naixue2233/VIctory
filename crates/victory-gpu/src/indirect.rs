@@ -19,24 +19,30 @@
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::s;
+use windows::core::{Interface, s};
 
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1), UAV(u2)"
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint has_count; };
 RWByteAddressBuffer args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
+RWByteAddressBuffer count_buf : register(u2);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= records) return;
+    uint limit = records;
+    [branch]
+    if (has_count != 0) {
+        limit = min(records, count_buf.Load(0));
+    }
+    if (id.x >= limit) return;
     uint at = id.x * stride;
     uint cost;
     if (kind <= 1) {
@@ -60,9 +66,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         cost = g.x * g.y * g.z * 128;
         args.Store3(at, g);
     }
-    uint before;
-    budget.InterlockedAdd(0, cost, before);
-    if (before >= BUDGET || before + cost > BUDGET) {
+    uint cur = budget.Load(0);
+    bool keep = false;
+    if (cost == 0) {
+        keep = cur < BUDGET;
+    } else {
+        [allow_uav_condition]
+        while (cur < BUDGET && cur + cost <= BUDGET) {
+            uint prev;
+            budget.InterlockedCompareExchange(0, cur, cur + cost, prev);
+            if (prev == cur) {
+                keep = true;
+                break;
+            }
+            cur = prev;
+        }
+    }
+    if (!keep) {
         // Draws keep their layout with no vertices; groups become zero.
         args.Store(at, 0);
     }
@@ -141,24 +161,33 @@ fn make() -> windows::core::Result<Clamp> {
 
 /// Records, in `list`, the clamp of `records` records of `kind` (PC
 /// argument numbering) `stride` bytes apart at host address `gpu` in
-/// `buffer`, and leaves the buffer ready to be read as arguments. Replaces
-/// the list's compute root signature and pipeline (callers bind theirs
-/// after). False if the clamp is not available.
+/// `buffer` (bounded by `count` when present), and leaves the buffers ready
+/// to be read as arguments. Replaces the list's compute root signature and
+/// pipeline (callers bind theirs after). False if the clamp is not
+/// available.
 pub(crate) fn bound(
     list: &HostList,
     buffer: &ID3D12Resource,
     gpu: u64,
+    count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
 ) -> bool {
     let (Some(c), Some(budget)) = (clamp(), list.budget()) else {
         return false;
     };
-    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+    if records == 0
+        || !gpu.is_multiple_of(4)
+        || !stride.is_multiple_of(4)
+        || count.is_some_and(|(_, g)| !g.is_multiple_of(4))
+    {
         return false;
     }
+    let count_buf = count
+        .map(|(b, _)| b)
+        .filter(|b| b.as_raw() != buffer.as_raw());
     let l = &list.list;
-    let constants = [kind, stride, records, 0];
-    // SAFETY: an open list; our root signature, pipeline and a live buffer
+    let constants = [kind, stride, records, u32::from(count.is_some())];
+    // SAFETY: an open list; our root signature, pipeline and live buffers
     // the caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
@@ -168,30 +197,49 @@ pub(crate) fn bound(
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootUnorderedAccessView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
+        l.SetComputeRootUnorderedAccessView(3, count.map_or(gpu, |(_, g)| g));
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[
+        let mut barriers = vec![
             uav_barrier(),
             transition(
                 buffer,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             ),
-        ]);
+        ];
+        if let Some(cb) = count_buf {
+            barriers.push(transition(
+                cb,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+            ));
+        }
+        l.ResourceBarrier(&barriers);
     }
     true
 }
 
-/// After the execution: the buffer back to unordered access, where the
-/// title's passes keep using it.
-pub(crate) fn done(list: &HostList, buffer: &ID3D12Resource) {
-    // SAFETY: an open list and a live buffer.
-    unsafe {
-        list.list.ResourceBarrier(&[transition(
-            buffer,
+/// After the execution: the buffers back to unordered access, where the
+/// title's passes keep using them.
+pub(crate) fn done(
+    list: &HostList,
+    buffer: &ID3D12Resource,
+    count: Option<&ID3D12Resource>,
+) {
+    let mut barriers = vec![transition(
+        buffer,
+        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    )];
+    if let Some(cb) = count.filter(|b| b.as_raw() != buffer.as_raw()) {
+        barriers.push(transition(
+            cb,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        )])
-    };
+        ));
+    }
+    // SAFETY: an open list and live buffers.
+    unsafe { list.list.ResourceBarrier(&barriers) };
 }
 
 fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
@@ -199,7 +247,9 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
         Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
         },
     }
 }
@@ -213,5 +263,55 @@ mod tests {
             return; // no host GPU here
         }
         assert!(super::clamp().is_some());
+    }
+
+    #[test]
+    fn clamp_honours_count_buffer_and_does_not_wrap_budget() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let (args, args_ptr) = host.shared_buffer(4096).unwrap();
+        let (count, count_ptr) = host.shared_buffer(256).unwrap();
+        // safety: both buffers are mapped shared memory of the sizes above.
+        let (args_gpu, count_gpu) = unsafe {
+            let records = std::slice::from_raw_parts_mut(args_ptr.cast::<[u32; 4]>(), 80);
+            records[0] = [100, 2, 0, 0];
+            for slot in &mut records[1..] {
+                *slot = [1 << 24, 16, 0, 0];
+            }
+            count_ptr.cast::<u32>().write(1);
+            (args.GetGPUVirtualAddress(), count.GetGPUVirtualAddress())
+        };
+        assert!(super::bound(
+            &list,
+            &args,
+            args_gpu,
+            Some((&count, count_gpu)),
+            (0, 16, 80),
+        ));
+        super::done(&list, &args, Some(&count));
+        list.close();
+        host.execute(&[&list]);
+        // safety: `host.execute` waits for completion; `args` is mapped.
+        let out = unsafe { std::slice::from_raw_parts(args_ptr.cast::<[u32; 4]>(), 80) };
+        assert_eq!(out[0], [100, 2, 0, 0]);
+        assert_eq!(out[1], [1 << 24, 16, 0, 0]);
+
+        let list2 = host.new_list().unwrap();
+        // safety: mapped shared memory.
+        unsafe {
+            let records = std::slice::from_raw_parts_mut(args_ptr.cast::<[u32; 4]>(), 80);
+            for slot in records.iter_mut() {
+                *slot = [1 << 24, 16, 0, 0];
+            }
+        }
+        assert!(super::bound(&list2, &args, args_gpu, None, (0, 16, 80)));
+        super::done(&list2, &args, None);
+        list2.close();
+        host.execute(&[&list2]);
+        // safety: `host.execute` waits for completion.
+        let out = unsafe { std::slice::from_raw_parts(args_ptr.cast::<[u32; 4]>(), 80) };
+        assert_eq!(out.iter().filter(|r| r[0] > 0).count(), 2);
     }
 }

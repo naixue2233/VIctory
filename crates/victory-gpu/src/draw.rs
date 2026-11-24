@@ -135,6 +135,9 @@ pub(crate) fn dispatched() -> u64 {
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
+    if address == 0 {
+        return None;
+    }
     let shadow = crate::shadow::find(address, 1)?;
     let len = shadow
         .left(address)
@@ -375,6 +378,9 @@ impl State {
         }
         if indexed {
             let v = self.index;
+            if v.address == 0 || v.size == 0 {
+                return false;
+            }
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 return false;
             };
@@ -469,12 +475,14 @@ impl State {
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
-                    let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(slot))
-                    else {
-                        once!(slot, "a shader reads a root view the title did not set");
-                        continue;
+                    let gpu = match self.roots_ref(compute).get(usize::from(slot)) {
+                        Some(Root::View(address)) => root_view(list, *address, srv),
+                        _ => {
+                            once!(slot, "a shader reads a root view the title did not set");
+                            None
+                        }
                     };
-                    let Some(gpu) = root_view(list, *address, srv) else {
+                    let Some(gpu) = gpu.or_else(|| crate::host::host()?.null_root_view()) else {
                         continue;
                     };
                     // SAFETY: an open list; the address is in live memory.
@@ -951,7 +959,17 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let len = u64::from(stride) * u64::from(max.max(1));
+        if max == 0 {
+            return true;
+        }
+        let Some(len) = u64::from(stride).checked_mul(u64::from(max)) else {
+            why("arguments overflow");
+            return false;
+        };
+        if len == 0 {
+            why("zero stride");
+            return false;
+        }
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -977,8 +995,15 @@ impl State {
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
+        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.gpu(*at)));
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(
+            list,
+            &args.buffer,
+            args.gpu(arguments),
+            count_arg,
+            (kind, stride, max),
+        ) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -997,7 +1022,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args.buffer, count_arg.map(|(b, _)| b));
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1021,7 +1046,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args.buffer, count_arg.map(|(b, _)| b));
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
