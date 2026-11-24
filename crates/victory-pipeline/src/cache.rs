@@ -56,20 +56,29 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .open(&tmp)
+            .with_context(|| format!("staging {}", tmp.display()))?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
-        if published.is_err() {
+        if let Err(e) = published {
             let _ = std::fs::remove_file(&tmp);
+            // Another caller published the same key first. Entries are
+            // content-addressed, so its bytes are ours. On Windows the rename
+            // over it fails (os error 5) while that entry is open, for example
+            // by the worker reading it back or by a scanner.
+            if path.is_file() {
+                tracing::trace!(converter = converter.id(), key = %key.to_hex(), error = %e, "entry published by another caller");
+                return Ok(path);
+            }
+            return Err(anyhow::Error::new(e).context(format!("publishing {}", path.display())));
         }
-        published?;
         Ok(path)
     }
 }
@@ -135,6 +144,97 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
+        );
+    }
+
+    #[test]
+    fn concurrent_callers_all_get_the_entry() {
+        // The title's pipeline workers translate the same shader at once and
+        // read the entry back straight away: publishing must not fail for the
+        // ones that lose the race to another worker.
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let threads = 16;
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    for round in 0..50u32 {
+                        let input = format!("abc{round}");
+                        barrier.wait();
+                        let path = cache.get_or_convert(&conv, input.as_bytes()).unwrap();
+                        assert_eq!(
+                            std::fs::read(&path).unwrap(),
+                            input.to_ascii_uppercase().as_bytes()
+                        );
+                    }
+                });
+            }
+        });
+        for shard in std::fs::read_dir(tmp.path().join("cache")).unwrap() {
+            for entry in std::fs::read_dir(shard.unwrap().path()).unwrap() {
+                let name = entry.unwrap().file_name();
+                assert!(
+                    !name.to_string_lossy().starts_with(".tmp-"),
+                    "staging file left: {name:?}"
+                );
+            }
+        }
+    }
+
+    /// Publishes its own entry while converting, as another worker that won
+    /// the race would, and keeps it open the way a reader or a scanner does.
+    struct Racer {
+        path: std::sync::OnceLock<PathBuf>,
+        held: std::sync::Mutex<Option<std::fs::File>>,
+    }
+
+    impl Converter for Racer {
+        fn id(&self) -> &'static str {
+            "test.racer"
+        }
+        fn version(&self) -> u32 {
+            1
+        }
+        fn convert(&self, input: &[u8]) -> Result<Vec<u8>> {
+            let output = input.to_ascii_uppercase();
+            let path = self.path.get().unwrap();
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, &output)?;
+            let mut open = std::fs::OpenOptions::new();
+            open.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // FILE_SHARE_READ only: replacing the file is refused.
+                open.share_mode(1);
+            }
+            *self.held.lock().unwrap() = Some(open.open(path)?);
+            Ok(output)
+        }
+    }
+
+    #[test]
+    fn losing_the_publication_race_uses_the_winners_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Racer {
+            path: std::sync::OnceLock::new(),
+            held: std::sync::Mutex::new(None),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        conv.path.set(path.clone()).unwrap();
+
+        assert_eq!(cache.get_or_convert(&conv, b"abc").unwrap(), path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "the staging file is removed"
         );
     }
 
