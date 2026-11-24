@@ -221,9 +221,9 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 /// sits next to the output binary, and this module is compiled only then.
 #[cfg(victory_agility)]
 mod agility {
-    /// Agility SDK version, matching `D3D12Core.dll` `1.614.1`.
+    /// Agility SDK version, matching `D3D12Core.dll` `1.620.2`.
     #[unsafe(no_mangle)]
-    pub static D3D12SDKVersion: u32 = 614;
+    pub static D3D12SDKVersion: u32 = 620;
 
     /// Path the loader appends to the executable's directory.
     const SDK_PATH: &[u8] = b".\\D3D12\\\0";

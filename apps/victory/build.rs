@@ -15,8 +15,8 @@
 
 use std::path::PathBuf;
 
-/// Agility SDK version the exports below announce, matching `1.614.1`.
-const SDK_VERSION: u32 = 614;
+/// Agility SDK version the exports below announce, matching `1.620.2`.
+const SDK_VERSION: u32 = 620;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
