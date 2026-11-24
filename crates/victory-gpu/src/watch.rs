@@ -226,6 +226,9 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         g.protected.remove(&block);
         g.clean.remove(&block);
     }
+    drop(g);
+    crate::resource::evict_placed_textures(at, len);
+    crate::shadow::evict_loose(at, len);
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

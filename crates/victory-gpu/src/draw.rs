@@ -142,6 +142,12 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        let wanted = if srv {
+            (D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0) as u32
+        } else {
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32
+        };
+        list.transition_buffer(&shadow, wanted);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -333,7 +339,7 @@ impl State {
 
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
@@ -361,6 +367,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -379,6 +386,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_INDEX_BUFFER.0 as u32);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -493,9 +501,10 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return;
         }
@@ -622,30 +631,30 @@ impl State {
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| {
+                if u.kind == ResourceType::Cbv {
+                    return true;
+                }
+                // On hosts whose shader-visible view heap is capped below the
+                // title's (e.g. NVIDIA's 1,000,000-descriptor limit), any table
+                // entry past the mirrored region must be remapped into dynamic
+                // slots; otherwise the shader reads into the dynamic scratch
+                // region or past the end of the host heap.
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot))
+                else {
+                    return false;
+                };
+                let handle = table + u64::from(u.table_offset_dwords) * 4;
+                let Some(heap) = self.heap_of(handle) else {
+                    return false;
+                };
+                match (heap.host(), heap.index(handle)) {
+                    (Some(host), Some(index)) => !host.is_sampler() && !host.in_range(index),
+                    _ => false,
+                }
+            })
             .map(|u| u.slot)
             .collect();
-        // Tables reaching past a host heap smaller than the title's (the
-        // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
-        // title's slots there have no host slot of their own.
-        for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
-                continue;
-            }
-            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-                continue;
-            };
-            let end = table + u64::from(u.table_offset_dwords) * 4;
-            let Some(heap) = self.heap_of(table) else {
-                continue;
-            };
-            let (Some(host), Some(index)) = (heap.host(), heap.index(end)) else {
-                continue;
-            };
-            if index >= host.count() {
-                fresh.push(u.slot);
-            }
-        }
         fresh.sort_unstable();
         fresh.dedup();
         for u in used.iter().filter(tables) {
@@ -938,8 +947,9 @@ impl State {
         count: Option<u64>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
-        #[cfg(feature = "diagnostics")]
+        #[cfg(windows)]
         if crate::pipeline::is_skipped(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;
         }
@@ -976,9 +986,10 @@ impl State {
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
+            list.transition_buffer(s, 0x200);
         }
         // Bounded first: the clamp binds a compute pipeline of its own.
-        if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
+        if !crate::indirect::bound(list, &args, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
             return false;
         }
@@ -997,7 +1008,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &args.buffer);
+            crate::indirect::done(list, &args);
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
@@ -1021,7 +1032,7 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
-        crate::indirect::done(list, &args.buffer);
+        crate::indirect::done(list, &args);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -1085,6 +1096,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
         shadow.refresh(list, address, len);
         if u.kind == ResourceType::Uav {
             shadow.gpu_writes(list, address, len);
+            list.transition_buffer(&shadow, UNORDERED_ACCESS);
+        } else if u.kind == ResourceType::Cbv {
+            list.transition_buffer(&shadow, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0 as u32);
+        } else if u.kind == ResourceType::Srv {
+            list.transition_buffer(&shadow, SHADER_RESOURCE);
         }
     }
     match (view, u.kind) {

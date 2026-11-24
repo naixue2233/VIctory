@@ -318,11 +318,23 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+            if VirtualQueryEx(
+                GetCurrentProcess(),
+                address,
+                info.as_mut_ptr(),
+                std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+            ) != 0
+            {
+                let size = info.assume_init().RegionSize;
+                victory_gpu::title_memory_remapped(address as usize, size);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        victory_gpu::title_memory_remapped(user as usize, size);
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

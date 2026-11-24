@@ -198,6 +198,16 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 impl HostHeap {
+    /// Whether this heap holds samplers rather than CBV/SRV/UAV views.
+    pub(crate) fn is_sampler(&self) -> bool {
+        self.sampler
+    }
+
+    /// Whether title slot `index` fits in the mirrored part of the host heap.
+    pub(crate) fn in_range(&self, index: u32) -> bool {
+        index < self.count
+    }
+
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
@@ -236,6 +246,7 @@ impl HostHeap {
 
     /// The title slots this heap has host slots for; fewer than the title's
     /// when the host caps its size.
+    #[allow(dead_code)]
     pub(crate) fn count(&self) -> u32 {
         self.count
     }

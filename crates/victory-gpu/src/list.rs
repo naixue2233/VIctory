@@ -1050,6 +1050,9 @@ mod state {
     /// programs take `x` groups only.
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
+        if x == 0 || y == 0 || z == 0 {
+            return;
+        }
         if y * z != 1 {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(x, y, z, "a mesh dispatch with y or z groups"));
@@ -1057,8 +1060,8 @@ mod state {
         with_state(this, |list, s| s.dispatch_mesh(list, x));
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`.
-    /// shortcut: dispatches whose group count is in GPU memory (indirect)
-    /// are dropped; make them ExecuteIndirect when the title uses them.
+    /// With `indirect != 0`, runs as indirect execution of one mesh dispatch
+    /// (stride 12, kind 10) through State::execute_indirect.
     pub(super) extern "system" fn dispatch_mesh_x(
         this: This,
         x: u32,
@@ -1066,13 +1069,22 @@ mod state {
         indirect: u64,
         _payload: u64,
     ) {
+        const MESH: u32 = 10;
+        const STRIDE: u32 = 12;
         super::count_draw();
-        if indirect != 0 {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("indirect mesh dispatches dropped"));
+        if indirect == 0 {
+            if x != 0 {
+                with_state(this, |list, s| s.dispatch_mesh(list, x));
+            }
             return;
         }
-        with_state(this, |list, s| s.dispatch_mesh(list, x));
+        let mut ran = false;
+        with_state(this, |list, s| {
+            ran = s.execute_indirect(list, (MESH, STRIDE, 1), indirect, None);
+        });
+        if !ran {
+            super::INDIRECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub(super) extern "system" fn draw_indexed(
         this: This,

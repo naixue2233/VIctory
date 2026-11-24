@@ -1140,26 +1140,97 @@ pub(crate) extern "system" fn create_at_address(
 /// resource object (device 0x230, Grand Theft Auto VI's streamed and
 /// interface textures), by address and description: a resource at that
 /// address, made the first time a draw reads one.
-/// shortcut: never released (one host texture per distinct address and
-/// description viewed); release them when the title unmaps or reuses the
-/// memory once streaming grows VRAM use.
+///
+/// Evicted when memory is remapped or unmapped, or when cache exceeds capacity.
 #[cfg(windows)]
-static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
+struct PlacedEntry {
+    resource: usize,
+    size: u64,
+    last_used: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(windows)]
+static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), PlacedEntry>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(windows)]
+static PLACED_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+pub(crate) fn evict_placed_textures(at: usize, len: usize) {
+    let at = at as u64;
+    let len = len as u64;
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut to_release = Vec::new();
+    map.retain(|&(addr, _), entry| {
+        let end = addr.saturating_add(entry.size);
+        let overlaps = addr < at + len && at < end;
+        if overlaps {
+            to_release.push(entry.resource);
+            false
+        } else {
+            true
+        }
+    });
+    drop(map);
+    for res in to_release {
+        crate::object::release_boxed::<Resource>(res as This);
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn evict_placed_textures(_at: usize, _len: usize) {}
 
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let tick = PLACED_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(&r) = map.get(&(address, *desc)) {
-        return Some(r as This);
+    if let Some(entry) = map.get(&(address, *desc)) {
+        entry.last_used.store(tick, std::sync::atomic::Ordering::Relaxed);
+        return Some(entry.resource as This);
     }
     // SAFETY: 56 bytes in the description's layout.
     let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
     if d.dimension == BUFFER {
         return None;
     }
+    let size = footprint(&d).map(|info| info.size).unwrap_or(d.width.max(4096));
+
+    let mut to_release = Vec::new();
+    // Evict any existing placed texture at this address or overlapping range.
+    map.retain(|&(addr, _), entry| {
+        let end = addr.saturating_add(entry.size);
+        let overlaps = addr < address + size && address < end;
+        if overlaps {
+            to_release.push(entry.resource);
+            false
+        } else {
+            true
+        }
+    });
+
+    const MAX_PLACED: usize = 384;
+    const TARGET_PLACED: usize = 256;
+    if map.len() >= MAX_PLACED {
+        let mut entries: Vec<((u64, [u32; 14]), u64, usize)> = map
+            .iter()
+            .map(|(&k, v)| (k, v.last_used.load(std::sync::atomic::Ordering::Relaxed), v.resource))
+            .collect();
+        entries.sort_by_key(|(_, used, _)| *used);
+        let count_to_remove = map.len().saturating_sub(TARGET_PLACED);
+        for (k, _, res) in entries.into_iter().take(count_to_remove) {
+            map.remove(&k);
+            to_release.push(res);
+        }
+    }
+    drop(map);
+
+    for res in to_release {
+        crate::object::release_boxed::<Resource>(res as This);
+    }
+
     let mut out = std::ptr::null();
     let made = create_at_address(
         std::ptr::null(),
@@ -1173,7 +1244,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     if made != S_OK {
         return None;
     }
-    map.insert((address, *desc), out as usize);
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.insert(
+        (address, *desc),
+        PlacedEntry {
+            resource: out as usize,
+            size,
+            last_used: std::sync::atomic::AtomicU64::new(tick),
+        },
+    );
     resource(out).host.is_some().then_some(out)
 }
 

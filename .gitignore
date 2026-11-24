@@ -76,3 +76,6 @@
 *.swp
 Thumbs.db
 .DS_Store
+*.patch
+*.cmd
+AGENT_HANDOFF.md
