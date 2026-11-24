@@ -277,6 +277,17 @@ pub(crate) struct HostPipeline {
     pub(crate) name: String,
 }
 
+/// Whether a `stage` program (`wave64`: written for 64-lane waves) cannot
+/// run on a host whose waves have at most `lanes` lanes. Such mesh and
+/// compute programs read lanes and wave-wide masks as the console's 64-lane
+/// wave has them; run as 32-lane waves, they hang some hosts' GPUs (the
+/// driver resets the device), so their draws and dispatches are dropped.
+/// Vertex and pixel programs run per lane and are kept.
+// shortcut: a wave64 program that never looks at other lanes would run.
+fn needs_wave64(stage: &str, wave64: bool, lanes: u32) -> bool {
+    wave64 && lanes < 64 && matches!(stage, "mesh" | "compute")
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
@@ -322,6 +333,16 @@ impl HostPipeline {
         };
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
+        }
+        let lanes = host()?.wave_lanes_max();
+        if stages
+            .iter()
+            .any(|(s, _)| needs_wave64(s.stage, s.wave64(), lanes))
+        {
+            return refuse(
+                "a mesh or compute program written for 64-lane waves, on a host without them",
+                shaders,
+            );
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -663,5 +684,23 @@ fn root_signature(
         let bytes =
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_wave64;
+
+    #[test]
+    fn wave64_mesh_and_compute_need_64_lane_hosts() {
+        // 32-lane hosts (NVIDIA): wave64 mesh and compute are refused.
+        assert!(needs_wave64("mesh", true, 32));
+        assert!(needs_wave64("compute", true, 32));
+        // Hosts that run 64-lane waves, and wave32 programs, are not.
+        assert!(!needs_wave64("mesh", true, 64));
+        assert!(!needs_wave64("compute", false, 32));
+        // Vertex and pixel programs run per lane.
+        assert!(!needs_wave64("pixel", true, 32));
+        assert!(!needs_wave64("vertex", true, 32));
     }
 }
