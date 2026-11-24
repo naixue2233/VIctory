@@ -1178,7 +1178,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
                 }
@@ -1214,7 +1214,7 @@ impl HostList {
                 }
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
-                    batch.flush();
+                    batch.gpu_writing(shadow, *address, *len);
                     shadow.writing(*address, *len);
                     continue;
                 }
@@ -1272,8 +1272,47 @@ impl Batch {
         self.textures.clear();
     }
 
+    /// As [`Batch::title_written`], for a step that writes only
+    /// `[dst, dst + len)`: refreshes elsewhere read the same bytes after it,
+    /// so they wait (a world submission has thousands of such copies, and
+    /// doing every refresh before each asked the kernel about the same big
+    /// buffers over a thousand times a frame).
+    fn title_written_at(&mut self, dst: usize, len: usize) {
+        let end = dst + len;
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes)
+            .into_iter()
+            .partition(|&(_, from, to)| from < end && dst < to);
+        self.refreshes = later;
+        Self::run(now);
+        self.textures.clear();
+    }
+
+    /// Before `shadow` hands `[address, address + len)` to shaders: a
+    /// refresh of that range is done first (a refresh skips ranges being
+    /// written). Other buffers' refreshes wait, since handing a range to
+    /// shaders writes no title memory.
+    fn gpu_writing(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let end = address + len;
+        let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.refreshes)
+            .into_iter()
+            .partition(|(s, from, to)| {
+                std::sync::Arc::ptr_eq(s, shadow) && *from < end && address < *to
+            });
+        self.refreshes = later;
+        Self::run(now);
+    }
+
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
+        Self::run(std::mem::take(&mut self.refreshes));
+    }
+
+    fn run(refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>) {
+        for (shadow, from, to) in refreshes {
             let started = std::time::Instant::now();
             let copied = shadow.update(from, to - from);
             let us = started.elapsed().as_micros() as u64;
