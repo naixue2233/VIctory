@@ -56,13 +56,14 @@ impl Cache {
             .convert(input)
             .with_context(|| format!("converter {} v{}", converter.id(), converter.version()))?;
         let dir = path.parent().expect("hashed path has a parent");
-        std::fs::create_dir_all(dir)?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .open(&tmp)
+            .with_context(|| format!("staging {}", tmp.display()))?;
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -76,7 +77,7 @@ impl Cache {
                 tracing::trace!(converter = converter.id(), key = %key.to_hex(), error = %e, "entry published by another caller");
                 return Ok(path);
             }
-            return Err(e.into());
+            return Err(anyhow::Error::new(e).context(format!("publishing {}", path.display())));
         }
         Ok(path)
     }
