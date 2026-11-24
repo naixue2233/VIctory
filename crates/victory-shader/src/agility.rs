@@ -13,7 +13,7 @@
 
 #[allow(dead_code)]
 #[unsafe(no_mangle)]
-pub static D3D12SDKVersion: u32 = 610;
+pub static D3D12SDKVersion: u32 = 620;
 
 /// A `const char*`, not a char array: the loader dereferences this symbol.
 #[allow(dead_code)]
